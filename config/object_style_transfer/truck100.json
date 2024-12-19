@@ -1,0 +1,5 @@
+{
+  "num_classes": 300,
+  "select_obj_id" : [107],
+  "epoch": 100
+}

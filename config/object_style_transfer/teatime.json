@@ -1,0 +1,5 @@
+{
+  "num_classes": 300,
+  "select_obj_id" : [48],
+  "finetune_iteration": 4500
+}
