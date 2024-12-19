@@ -1,0 +1,1 @@
+# FastText2ObjectStyle
