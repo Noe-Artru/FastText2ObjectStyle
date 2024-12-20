@@ -1,0 +1,6 @@
+# ninja log v5
+2	7087	1733130403674030888	/w/331/abarroso/style-splat/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/cuda_rasterizer/backward.o	a5db9d016feb3722
+2	7742	1733130404334027643	/w/331/abarroso/style-splat/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/cuda_rasterizer/forward.o	5887db237857d077
+3	16796	1733130413333983392	/w/331/abarroso/style-splat/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/cuda_rasterizer/rasterizer_impl.o	99da30439aec509c
+7093	32448	1733130429049906121	/w/331/abarroso/style-splat/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/ext.o	34fa99ad08078fdc
+7743	63402	1733130459961754135	/w/331/abarroso/style-splat/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/rasterize_points.o	1fc719f638e8d3b3

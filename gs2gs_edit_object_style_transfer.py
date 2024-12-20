@@ -376,7 +376,7 @@ if __name__ == "__main__":
     args.object_path = config.get("object_path", "object_mask")
     args.resolution = config.get("r", 1)
     args.lambda_dssim = config.get("lambda_dlpips", 0.5)
-    args.epochs = config.get("epochs", 2000)
+    args.epochs = config.get("epoch", 20)
     STYLE_TEXT = args.style_text # "red"
     STYLE_TEXT_FILE = STYLE_TEXT.replace(" ", "_")
     safe_state(args.quiet)
