@@ -67,7 +67,9 @@ class InstructPix2Pix(nn.Module):
         self.device = device
         self.num_train_timesteps = num_train_timesteps
         self.ip2p_use_full_precision = ip2p_use_full_precision
-        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(IP2P_SOURCE, torch_dtype=torch.float16, safety_checker=None, cache_dir='/w/331/abarroso/style-splat/.cache/huggingface')
+        # replace with your cache directory
+        cache_dir = 'your/cache/dir/goes/here'
+        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(IP2P_SOURCE, torch_dtype=torch.float16, safety_checker=None, cache_dir=cache_dir)
         pipe.scheduler = DDIMScheduler.from_pretrained(DDIM_SOURCE, subfolder="scheduler")
         pipe.scheduler.set_timesteps(100)
         assert pipe is not None
