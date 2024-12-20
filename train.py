@@ -23,8 +23,6 @@ import wandb
 import json
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
-    ## EDIT: to avoid running out of memory
-    opt.iterations = 5001
     first_iter = 0
     prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)

@@ -2,11 +2,10 @@
 # All rights reserved.
 
 # ------------------------------------------------------------------------
-# Modified from codes in Gaussian-Splatting and Gaussian-Grouping
+# Modified from codes in Gaussian-Splatting, Gaussian-Grouping and Style-Splat
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # Gaussian-Grouping research group, https://github.com/lkeab/gaussian-grouping
 
-#EDIT: Imported clip & ToPILImage for text based style transfer
 import clip
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -25,7 +24,7 @@ import shutil
 import torch
 import json
 import os
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torchvision import models
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from utils.general_utils import safe_state
@@ -37,13 +36,13 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 import random
 
-def random_words(n):
+def random_words(n): # Selects Random words as negative prompts
     with open("wordlist.10000.txt", 'r') as file:
         words = file.read().split()
 
     return random.sample(words, n)
 
-def cleanPointCloud(points, mask3d):
+def cleanPointCloud(points, mask3d): # Filters out outliers from the point cloud
     mask3d = mask3d.bool().squeeze().cpu().numpy() # N,
     points = points.detach().cpu().numpy() # N x 3
     print("Before: ", np.sum(mask3d))
@@ -60,9 +59,9 @@ def cleanPointCloud(points, mask3d):
     return updated_mask
 
 
-def perceptual_loss(original, modified, model):
-    features_original = model(original)
-    features_modified = model(modified)
+def regularization_loss(original_images, modified_images, model):
+    features_original = model(original_images)
+    features_modified = model(modified_images)
     loss = 0
     for f1, f2 in zip(features_original, features_modified):
         loss += F.mse_loss(f1, f2)
@@ -101,29 +100,30 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
         updated_mask = torch.Tensor(cleanPointCloud(gaussians._xyz, mask3d)).to(gaussians._xyz.device)
         mask3d = updated_mask[:,None,None]
 
-    # gaussians.training_setup(opt)
     gaussians.finetune_setup(opt,mask3d)
 
 
-    #clip preprocess
+    #CLIP preprocessing
     target_text = STYLE_TEXT
     neg = random_words(10)
-    # neg = "water, ice, snow, rain, cold, winter, frost, freeze, chill"
-    # neg = "ice, cold, freezing, purple, grass, helicopter, patches"
     print("Chosen negative words: ", neg)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
+
     target_text_features = model.encode_text(clip.tokenize(target_text).to(device))
     target_neg_text_features = model.encode_text(clip.tokenize(neg).to(device))
     target_text_features_normed = target_text_features / target_text_features.norm(dim=-1, keepdim=True)
     target_neg_text_features_normed = target_neg_text_features / target_neg_text_features.norm(dim=-1, keepdim=True)
-    #image should already be the right size of 224x224
+    
     clip_preprocess = T.Compose([
         T.Normalize(                    # Normalize using CLIP's mean and std
             mean=(0.48145466, 0.4578275, 0.40821073),
             std=(0.26862954, 0.26130258, 0.27577711),
         )
     ])
+
+    # VGG16 for regularization loss
     vgg = models.vgg16(pretrained=True).features[:16].to(device).half()
     vgg.eval()
     for param in vgg.parameters():
@@ -157,8 +157,9 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
                 "Avg Backprop Time (s)": f"{0:.4f}",
                 "GPU Mem": mem_usage,
             })
-        for batch_idx, batch_data in enumerate(dataloader):
+        for batch_idx, batch_data in enumerate(dataloader): # Main Training Loop
             
+            #Render batch of current scene
             start_time = time.time()
             batch_rendered_images = batch_data["rendered_images"].squeeze(1).half().to(device)
             preprocessed_imgs = clip_preprocess(batch_rendered_images).to(device)
@@ -166,15 +167,15 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
             image_encoding_normed = image_encoding/image_encoding.norm(dim=-1, keepdim=True)
             grab_time += time.time()-start_time
 
-
+            # Compute cosine similarities
             start_time = time.time()  
             similarity = torch.nn.functional.cosine_similarity(image_encoding_normed, target_text_features_normed.detach())
             neg_similarity = torch.nn.functional.cosine_similarity(image_encoding_normed.unsqueeze(1), target_neg_text_features_normed.unsqueeze(0).detach(), dim=-1)
 
+            # Compute loss
             temperature = 1
             loss = -torch.log(torch.exp(similarity/temperature) / (torch.exp(similarity/temperature) + torch.sum(torch.exp(neg_similarity/temperature)))).sum()
-            regularization_loss = perceptual_loss(batch_data["gt_images"].to(device).half(), batch_rendered_images, vgg)
-            
+            regularization_loss = regularization_loss(batch_data["gt_images"].to(device).half(), batch_rendered_images, vgg)
             loss = loss + regularization_loss * scale_reg_loss
             epoch_loss += loss.item()
             loss_time+= time.time() - start_time
@@ -183,8 +184,6 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
             start_time = time.time()
             mem_usage = get_memory_usage() 
             loss.backward()
-            # gaussians._features_dc.grad = gaussians._features_dc.grad * mask3d # Uncomment if using training_setup instead of finetune_setup
-            # gaussians._features_rest.grad = gaussians._features_rest.grad * mask3d
             gaussians.optimizer.step()
             backprop_time += time.time() - start_time 
 
@@ -248,15 +247,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
 def style(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : list, removal_thresh : float,  epoch: int, scale_reg_loss: float):
-    # 1. load gaussian checkpoint
+    # 1. load Gaussian checkpoint
     for obj_id in select_obj_id:
         print("NOW DOING: " , STYLE_TEXT, obj_id)
-        print()
         print()
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         num_classes = dataset.num_classes
-        # print("Num classes: ",num_classes)
         classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
         classifier.cuda()
         classifier.load_state_dict(torch.load(os.path.join(dataset.model_path,"point_cloud","iteration_"+str(scene.loaded_iter),"classifier.pth")))
@@ -264,10 +261,10 @@ def style(dataset : ModelParams, iteration : int, pipeline : PipelineParams, ski
         
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    # 2. style selected object
+    # 2. style selected object (Main Training Loop)
         gaussians, pcd_path = finetune_style(opt, dataset.model_path, scene.getTrainCameras(), gaussians, pipeline, background, classifier, obj_id, epoch, scale_reg_loss)
         
-        # 3. render new result
+        # 3. Render stylized result
         dataset.object_path = 'object_mask'
         dataset.images = 'images'
         scene = Scene(dataset, gaussians, load_iteration=f'_style/{obj_id}_{STYLE_TEXT_FILE}', shuffle=False)
@@ -276,9 +273,8 @@ def style(dataset : ModelParams, iteration : int, pipeline : PipelineParams, ski
                 render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, classifier)
         print("PCD PATH::")
         print(pcd_path)
-        shutil.rmtree(pcd_path)
-            # if not skip_test:
-            #     render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, classifier)
+        shutil.rmtree(pcd_path) #Avoids accumulating point clouds
+        
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -317,7 +313,10 @@ if __name__ == "__main__":
     args.lambda_dssim = config.get("lambda_dlpips", 0.5)
     args.epoch = config.get("epoch", 2000)
 
-    STYLE_TEXT = args.style_text # "red"
+    # Set the style text
+    STYLE_TEXT = args.style_text
     STYLE_TEXT_FILE = STYLE_TEXT.replace(" ", "_")
     safe_state(args.quiet)
+
+    # Run style transfer
     style(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, opt.extract(args), args.select_obj_id, args.epoch, args.scale_reg_loss)
