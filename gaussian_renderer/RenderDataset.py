@@ -22,8 +22,9 @@ class RenderDataset(Dataset):
         gt_image = self.gt_images[idx]
         # Dynamically render the image
         view = self.viewpoints[idx]
-        view.image_height = 224
-        view.image_width = 224
+        #Render at the image size
+        view.image_height = self.image_size
+        view.image_width = self.image_size
         render_pkg = render(view, self.gaussians, self.pipeline, self.background)
         rendered_image = render_pkg["render"].to("cpu")
         mask2d = view.objects == self.obj_id
@@ -35,11 +36,12 @@ class RenderDataset(Dataset):
         mask2d = (mask2d >= 0.5).to(torch.bool)
         # Apply masks and resizing
         rendered_image = rendered_image * mask2d
-        #rendered_image = torch.nn.functional.interpolate(
-        #    rendered_image, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False
-        #)
         return {
             "indices": idx,
             "rendered_images": rendered_image,
             "gt_images": gt_image,
         }
+    def update_edited_images(self, edited_batch, indices, expected_indices):
+        #self.previously_edited_images.update({idx: img.cpu() for idx, img in zip(indices, edited_batch)})
+        for idx, img in zip(indices, edited_batch):
+            self.previously_edited_images[int(idx)] = img.cpu() 

@@ -6,16 +6,10 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # Gaussian-Grouping research group, https://github.com/lkeab/gaussian-grouping
 
-#EDIT: Imported clip & ToPILImage for text based style transfer
-import clip
-import torch.nn.functional as F
-import torchvision.transforms as T
-import matplotlib.pyplot as plt
-import time
-import torch
 import gc
+import matplotlib.pyplot as plt
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from argparse import ArgumentParser
-from random import randint
 from os import makedirs
 from tqdm import tqdm
 import open3d as o3d
@@ -24,24 +18,17 @@ import torchvision
 import shutil
 import torch
 import json
+import functools
 import os
-from torch.utils.data import Dataset, DataLoader
-from torchvision import models
+import time
+from gaussian_renderer.RenderDataset import RenderDataset
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from utils.general_utils import safe_state
 from gaussian_renderer import GaussianModel
 from gaussian_renderer import render
 from scene import Scene
-from gaussian_renderer.RenderDataset import RenderDataset
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-import random
-
-def random_words(n):
-    with open("wordlist.10000.txt", 'r') as file:
-        words = file.read().split()
-
-    return random.sample(words, n)
+from gs2gs.ip2p import InstructPix2Pix
+from torch.utils.data import DataLoader
 
 def cleanPointCloud(points, mask3d):
     mask3d = mask3d.bool().squeeze().cpu().numpy() # N,
@@ -49,6 +36,7 @@ def cleanPointCloud(points, mask3d):
     print("Before: ", np.sum(mask3d))
     object_points = points[mask3d]
     point_cloud = o3d.geometry.PointCloud()
+    # EDIT: object_points was the wrong type for some reason
     object_points = np.array(object_points, dtype=np.float64)
     point_cloud.points = o3d.utility.Vector3dVector(object_points)
     cl, ind = point_cloud.remove_statistical_outlier(nb_neighbors=75, std_ratio=0.5)
@@ -60,13 +48,62 @@ def cleanPointCloud(points, mask3d):
     return updated_mask
 
 
-def perceptual_loss(original, modified, model):
-    features_original = model(original)
-    features_modified = model(modified)
-    loss = 0
-    for f1, f2 in zip(features_original, features_modified):
-        loss += F.mse_loss(f1, f2)
-    return loss
+class LossConfig:
+    def __init__(self, 
+                 device='cuda',
+                 patch_size=32, 
+                 use_lpips=True, 
+                 lpips_loss_mult=3.0, 
+                 interlevel_loss_mult=1.0, 
+                 distortion_loss_mult=1.0, 
+                 orientation_loss_mult=1.0, 
+                 pred_normal_loss_mult=1.0, 
+                 predict_normals=False):
+        self.device = device
+        self.patch_size = patch_size
+        self.use_lpips = use_lpips
+        self.lpips_loss_mult = lpips_loss_mult
+        self.interlevel_loss_mult = interlevel_loss_mult
+        self.distortion_loss_mult = distortion_loss_mult
+        self.orientation_loss_mult = orientation_loss_mult
+        self.pred_normal_loss_mult = pred_normal_loss_mult
+        self.predict_normals = predict_normals
+
+class LossComputation:
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device(config.device)
+    def rgb_loss(self, target, prediction):
+        # Implement the RGB loss (e.g., L2 loss or L1 loss)
+        return torch.nn.functional.mse_loss(prediction, target)
+    
+    def l1_loss(self, target, prediction):
+        return torch.nn.functional.l1_loss(prediction, target)   
+    def lpips(self, pred_patches, gt_patches, device):
+        lpips = LearnedPerceptualImagePatchSimilarity().to(device)
+        return lpips(pred_patches, gt_patches)
+    
+    def get_loss_dict(self, output_images_rgb, images, device, metrics_dict=None):
+        loss_dict = {}
+        #images must be on right device
+        loss_dict["l1_loss"] = self.l1_loss(images, output_images_rgb)
+        loss_dict["rgb_loss"] = self.rgb_loss(images,output_images_rgb)
+        if self.config.use_lpips:
+            patch_size = self.config.patch_size
+            out_patches = (
+                output_images_rgb
+                .view(-1, patch_size, patch_size, 3)
+                .permute(0, 3, 1, 2) * 2 - 1
+            )
+            out_patches.clamp_(-1,1)
+            gt_patches = (
+                images
+                .view(-1, patch_size, patch_size, 3)
+                .permute(0, 3, 1, 2) * 2 - 1
+            )
+            gt_patches.clamp_(-1,1)
+            loss_dict["lpips_loss"] = self.config.lpips_loss_mult * self.lpips(out_patches, gt_patches, device)
+        return loss_dict    
 
 def get_all_gt_images(viewpoint_stack, OBJ_ID, image_size):
     gt_images, all_mask2d = zip(*[(view.original_image, (view.objects == OBJ_ID).unsqueeze(0)) for view in viewpoint_stack])
@@ -76,23 +113,40 @@ def get_all_gt_images(viewpoint_stack, OBJ_ID, image_size):
     all_mask2d = all_mask2d.to(gt_images.device)
     gt_images = gt_images*all_mask2d
     gt_images = torch.nn.functional.interpolate(
-    gt_images, size=(image_size, image_size), mode='bilinear', align_corners=False)
+        gt_images, size=(image_size, image_size), mode='bilinear', align_corners=False
+    )  # Shape: [N, C, image_size, image_size]
     return gt_images
+ 
 
 def get_memory_usage(return_all = True):
+    # GPU memory usage
     gpu_memory_allocated = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
     gpu_memory_reserved = torch.cuda.memory_reserved(0) / 1e9 if torch.cuda.is_available() else 0
     if return_all:
         return f"GPU Allocated: {gpu_memory_allocated:.2f} GB | GPU Reserved: {gpu_memory_reserved:.2f} GB"
     else:
         return  f"GPU Allocated: {gpu_memory_allocated:.2f} GB"
- 
-
-def finetune_style(opt, model_path, views, gaussians, pipeline, background, classifier, OBJ_ID, epoch, scale_reg_loss):
-    batch_size = 16 # 32 For roughly 30GB RAM
-    image_size = 224
-    epochs = epoch
     
+
+def finetune_style(opt, model_path, views, gaussians, pipeline, background, classifier, OBJ_ID, epochs):
+
+    loss_config = LossConfig()
+    Loss = LossComputation(loss_config)
+    #Configs 
+    batch_size = 64  # Adjust based on available GPU memory
+    edit_frequency = 20 #edit every x epochs
+    
+    guidance_scale: float = 12  
+    """(text) guidance scale for InstructPix2Pix"""
+    image_guidance_scale: float = 1.75
+    """image guidance scale for InstructPix2Pix"""
+    diffusion_steps: int = 20
+    """Number of diffusion steps to take for InstructPix2Pix"""
+    lower_bound: float = 0.7
+    """Lower bound for diffusion timesteps to use for image editing"""
+    upper_bound: float = 0.98
+    image_size: int = 128
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     with torch.no_grad():
         logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
         prob_obj3d = torch.softmax(logits3d,dim=0)
@@ -101,50 +155,33 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
         updated_mask = torch.Tensor(cleanPointCloud(gaussians._xyz, mask3d)).to(gaussians._xyz.device)
         mask3d = updated_mask[:,None,None]
 
-    # gaussians.training_setup(opt)
     gaussians.finetune_setup(opt,mask3d)
-
-
-    #clip preprocess
-    target_text = STYLE_TEXT
-    neg = random_words(10)
-    # neg = "water, ice, snow, rain, cold, winter, frost, freeze, chill"
-    # neg = "ice, cold, freezing, purple, grass, helicopter, patches"
-    print("Chosen negative words: ", neg)
+    
+    #PRE-PROCESS
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = clip.load("ViT-B/32", device=device)
-    target_text_features = model.encode_text(clip.tokenize(target_text).to(device))
-    target_neg_text_features = model.encode_text(clip.tokenize(neg).to(device))
-    target_text_features_normed = target_text_features / target_text_features.norm(dim=-1, keepdim=True)
-    target_neg_text_features_normed = target_neg_text_features / target_neg_text_features.norm(dim=-1, keepdim=True)
-    #image should already be the right size of 224x224
-    clip_preprocess = T.Compose([
-        T.Normalize(                    # Normalize using CLIP's mean and std
-            mean=(0.48145466, 0.4578275, 0.40821073),
-            std=(0.26862954, 0.26130258, 0.27577711),
-        )
-    ])
-    vgg = models.vgg16(pretrained=True).features[:16].to(device).half()
-    vgg.eval()
-    for param in vgg.parameters():
-        param.requires_grad = False
-
+    device = torch.device(device)
+    ip2p = InstructPix2Pix(device, ip2p_use_full_precision=False)
+ 
+    target_text = STYLE_TEXT
+    target_text_features = ip2p.pipe._encode_prompt(
+            target_text, device=device, num_images_per_prompt=1, do_classifier_free_guidance=True)
+    target_text_features = torch.repeat_interleave(target_text_features,batch_size, dim=0)
+    
     #Load GT Images
-    gt_images = get_all_gt_images(views, OBJ_ID, image_size).half().to('cpu').detach()
-     
+    gt_images = get_all_gt_images(views, OBJ_ID, image_size).to('cpu').detach()
+    #Get 
     dataset = RenderDataset(views, gt_images, gaussians, pipeline, background,OBJ_ID, image_size,device)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
     losses = []
     mem_usage = get_memory_usage()
     total_batches = len(dataloader)
     progress_bar = tqdm(range(epochs), desc="Training:", dynamic_ncols=True)
-    gc.collect()
-    torch.cuda.empty_cache()   
+    seen_indices = []
     for epoch, _ in enumerate(progress_bar): 
         # Initialize timing accumulators
         grab_time = 0
-        loss_time = 0
+        edit_time = 0
         backprop_time = 0
         epoch_loss = 0
         progress_bar.set_postfix({
@@ -157,51 +194,77 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
                 "Avg Backprop Time (s)": f"{0:.4f}",
                 "GPU Mem": mem_usage,
             })
+        
         for batch_idx, batch_data in enumerate(dataloader):
             
+            # Time step 1: Grab Images from DataLoader
             start_time = time.time()
+            batch_gt_images = batch_data["gt_images"].half().to(device)
             batch_rendered_images = batch_data["rendered_images"].squeeze(1).half().to(device)
-            preprocessed_imgs = clip_preprocess(batch_rendered_images).to(device)
-            image_encoding = model.encode_image(preprocessed_imgs)
-            image_encoding_normed = image_encoding/image_encoding.norm(dim=-1, keepdim=True)
-            grab_time += time.time()-start_time
-
-
-            start_time = time.time()  
-            similarity = torch.nn.functional.cosine_similarity(image_encoding_normed, target_text_features_normed.detach())
-            neg_similarity = torch.nn.functional.cosine_similarity(image_encoding_normed.unsqueeze(1), target_neg_text_features_normed.unsqueeze(0).detach(), dim=-1)
-
-            temperature = 1
-            loss = -torch.log(torch.exp(similarity/temperature) / (torch.exp(similarity/temperature) + torch.sum(torch.exp(neg_similarity/temperature)))).sum()
-            regularization_loss = perceptual_loss(batch_data["gt_images"].to(device).half(), batch_rendered_images, vgg)
+            grab_time += time.time() - start_time
+            indices = batch_data["indices"]
             
-            loss = loss + regularization_loss * scale_reg_loss
-            epoch_loss += loss.item()
-            loss_time+= time.time() - start_time
-            gaussians.optimizer.zero_grad(set_to_none=True)
+            # Time step 2: Editing the images
+            start_time = time.time()         
+            if epoch % edit_frequency == 0:
+                with torch.no_grad():    
+                    edited_batch = ip2p.edit_image(
+                        target_text_features.to(device),
+                        batch_rendered_images,
+                        batch_gt_images,
+                        guidance_scale=guidance_scale,
+                        image_guidance_scale=image_guidance_scale,
+                        diffusion_steps=diffusion_steps,
+                        lower_bound=lower_bound,
+                        upper_bound=upper_bound,
+                    )
+                    dataset.update_edited_images(edited_batch, indices, seen_indices)
+                    seen_indices.append(indices)
+            else: 
+                edited_batch  = []
+                for i in indices:
+                    val = dataset.previously_edited_images.get(int(i)).half()
+                    edited_batch.append(val)
+                edited_batch = torch.stack(edited_batch).to(device)
+            edit_time += time.time() - start_time
+            
+            # Time step 3: Calculating the loss and doing backprop
+            if edited_batch.shape[2:] != batch_rendered_images[0].shape[1:]:
+                edited_batch = torch.nn.functional.interpolate(edited_batch, size=batch_rendered_images[0].shape[1:], mode='bilinear')
 
+            loss_dict = Loss.get_loss_dict(batch_rendered_images, edited_batch, device)
+            gaussians.optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", enabled=False):
+                loss = functools.reduce(torch.add, loss_dict.values())
+
+            loss_scaler = 1e2
+            loss = loss*loss_scaler
+            epoch_loss+= loss.item()
+            
+            # List all tensors currently residing on GPU
+            gc.collect()
+            torch.cuda.empty_cache()   
+            
+            # Clear the gradients
             start_time = time.time()
             mem_usage = get_memory_usage() 
             loss.backward()
-            # gaussians._features_dc.grad = gaussians._features_dc.grad * mask3d # Uncomment if using training_setup instead of finetune_setup
-            # gaussians._features_rest.grad = gaussians._features_rest.grad * mask3d
-            gaussians.optimizer.step()
             backprop_time += time.time() - start_time 
-
+            gaussians.optimizer.step()
 
             progress_bar.set_postfix({
                 "Batch": f"{batch_idx+1}/{total_batches}",
                 "Avg Batch Loss": f"{epoch_loss / (batch_idx+1):.7f}",
                 "Avg Epoch Loss": f"{sum(losses) / epoch if losses else 0 :.7f}",
                 "Avg Grab Time (s)": f"{grab_time / (batch_idx+1):.4f}",
-                "Avg Loss Time (s)": f"{loss_time / (batch_idx+1):.4f}",
+                "Avg Loss Time (s)": f"{edit_time / (batch_idx+1):.4f}",
                 "Avg Backprop Time (s)": f"{backprop_time / (batch_idx+1):.4f}",
                 "GPU Mem": mem_usage,
             })
         losses.append(epoch_loss)
-        gc.collect()
-        torch.cuda.empty_cache() 
+    
     progress_bar.close()
+
     
     point_cloud_path = os.path.join(model_path, f"point_cloud_style/{OBJ_ID}_{STYLE_TEXT_FILE}")
     makedirs(point_cloud_path, exist_ok=True)
@@ -219,53 +282,51 @@ def finetune_style(opt, model_path, views, gaussians, pipeline, background, clas
 
     # Save the plot in the graphs directory
     graphs_dir = "graphs"
-    plot_path = os.path.join(graphs_dir, f"loss_plot_{OBJ_ID}_{STYLE_TEXT}.png")
-    i = 0
-    new_plot_path = plot_path
-    while os.path.exists(new_plot_path):
-        new_plot_path = f"{plot_path.rsplit('.', 1)[0]}_{i}.png"
-        i += 1
-    plt.savefig(new_plot_path)
+    plot_path = os.path.join(graphs_dir, f"loss_plot_{OBJ_ID}_{STYLE_TEXT_FILE}.png")
+    plt.savefig(plot_path)
     plt.close()
-    print(f"Saved loss plot at: {new_plot_path}")
+    print(f"Saved loss plot at: {plot_path}")
     
     return gaussians, point_cloud_path
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier):
     render_path = os.path.join(model_path, name, "ours{}".format(iteration), "renders")
-    new_render_path = render_path
-    i = 0
-    while os.path.exists(new_render_path):
-        new_render_path = f"{render_path.rsplit('.', 1)[0]}_{i}"
-        i += 1
-
-    makedirs(new_render_path, exist_ok=True)
+    print("render")
+    print(render_path)
+    makedirs(render_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views[:30], desc="Rendering progress")):
         results = render(view, gaussians, pipeline, background)
         rendering = results["render"]
-        torchvision.utils.save_image(rendering, os.path.join(new_render_path, '{0:05d}'.format(idx) + ".png"))
+        gt = view.original_image[0:3, :, :]
+        # Calculate and print the difference between the rendered image and the ground truth
+        difference = torch.abs(rendering - gt)
+        difference_path = os.path.join(render_path, '{0:05d}_diff.png'.format(idx))
+        torchvision.utils.save_image(difference, difference_path)
+        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
 
-def style(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : list, removal_thresh : float,  epoch: int, scale_reg_loss: float):
+def style(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : list,  epochs: int):
     # 1. load gaussian checkpoint
     for obj_id in select_obj_id:
         print("NOW DOING: " , STYLE_TEXT, obj_id)
         print()
         print()
+        #determine SH_degree
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         num_classes = dataset.num_classes
         # print("Num classes: ",num_classes)
         classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
         classifier.cuda()
-        classifier.load_state_dict(torch.load(os.path.join(dataset.model_path,"point_cloud","iteration_"+str(scene.loaded_iter),"classifier.pth")))
+        classifier.load_state_dict(torch.load(os.path.join(dataset.model_path,"point_cloud","iteration_"+str(scene.loaded_iter),"classifier.pth"),weights_only=True))
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     # 2. style selected object
-        gaussians, pcd_path = finetune_style(opt, dataset.model_path, scene.getTrainCameras(), gaussians, pipeline, background, classifier, obj_id, epoch, scale_reg_loss)
+        gaussians, pcd_path = finetune_style(opt, dataset.model_path, scene.getTrainCameras(), gaussians, pipeline, background, classifier, obj_id, epochs)
         
         # 3. render new result
         dataset.object_path = 'object_mask'
@@ -289,9 +350,9 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--style_text", default="", type=str)
     parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--skip_test", action="store_true") 
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--scale_reg_loss", default=0, type=float)
+
     parser.add_argument("--config_file", type=str, default="", help="Path to the configuration file")
 
 
@@ -315,9 +376,8 @@ if __name__ == "__main__":
     args.object_path = config.get("object_path", "object_mask")
     args.resolution = config.get("r", 1)
     args.lambda_dssim = config.get("lambda_dlpips", 0.5)
-    args.epoch = config.get("epoch", 2000)
-
+    args.epochs = config.get("epochs", 2000)
     STYLE_TEXT = args.style_text # "red"
     STYLE_TEXT_FILE = STYLE_TEXT.replace(" ", "_")
     safe_state(args.quiet)
-    style(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, opt.extract(args), args.select_obj_id, args.epoch, args.scale_reg_loss)
+    style(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, opt.extract(args), args.select_obj_id, args.epochs)
