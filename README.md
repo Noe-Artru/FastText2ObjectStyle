@@ -1,4 +1,16 @@
 # FastText2ObjectStyle
+<table>
+  <tr>
+    <td align="center">
+      <img src="ExampleResults/TruckWithFlames.png" alt="Image1" width="100%"><br>
+      <b>Flaming Truck</b>
+    </td>
+    <td align="center">
+      <img src="ExampleResults/blackhole.png" alt="Image2" width="100%"><br>
+      <b>Black hole Manhole Cover</b>
+    </td>
+  </tr>
+</table>
 
 ## Installation
 
@@ -64,6 +76,33 @@ python gs2gs_edit_object_style_transfer.py -m outputs/truck \
         --config_file "config/object_style_transfer/truck.json" --skip_test \
         --style_text "Your Prompt goes here"
 ```
+
+## Various Results
+<table>
+  <tr>
+    <td align="center">
+      <img src="ExampleResults/fireFloor.png" alt="Image1" width="100%"><br>
+      <b>Fire Floor</b>
+    </td>
+    <td align="center">
+      <img src="ExampleResults/galaxy.png" alt="Image2" width="100%"><br>
+      <b>Galaxy Truck</b>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="ExampleResults/TruckWithSpikes.png" alt="Image1" width="100%"><br>
+      <b>Spiky Truck</b>
+    </td>
+    <td align="center">
+      <img src="ExampleResults/VanGogh.png" alt="Image2" width="100%"><br>
+      <b>Van Gogh Truck</b>
+    </td>
+  </tr>
+</table>
 
 ## Acknowledgements
 We would like to sincerely thank the authors of the following projects which serve as the basis for this project:
