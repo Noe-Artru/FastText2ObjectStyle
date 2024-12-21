@@ -1,4 +1,4 @@
-name: 
+name: fast-text-2-obj
 channels:
 - conda-forge
 - nvidia

@@ -1,5 +1,0 @@
-{
-  "num_classes": 300,
-  "select_obj_id" : [50],
-  "epoch": 25
-}

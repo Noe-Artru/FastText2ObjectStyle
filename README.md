@@ -20,10 +20,18 @@ git clone https://github.com/Noe-Artru/FastText2ObjectStyle.git
 ```
 
 ### Step 2: Set Up the Environment
-Ensure your environment meets all the necessary dependencies and requirements.
+Note: we use micromamba but feel free to use your 
+conda distrubtion of choice
+```bash
+micromamba create -f environment.yml
+micromamba activate fast-text-2-obj
+pip install -r requirements.txt
+```
 
 ### Step 3: Install DEVA Tracking
 ```bash
+pip install submodules/diff-gaussian-rasterization
+pip install submodules/simple-knn
 cd FastText2ObjectStyle
 git clone https://github.com/hkchengrex/Tracking-Anything-with-DEVA.git
 cd Tracking-Anything-with-DEVA
@@ -70,6 +78,8 @@ python text_edit_object_style_transfer.py -m outputs/truck \
 ```
 
 ### Step 4: Try out GS2GS based Stylization (Optional)
+NOTE before trying with GS2GS, please update the cache directory under 
+GaussianSplatting/ip2p.py to match a local folder of yours.
 Replace `truck` with the name of your dataset:
 ```bash
 python gs2gs_edit_object_style_transfer.py -m outputs/truck \
