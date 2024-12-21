@@ -1,4 +1,4 @@
-# FastText2ObjectStyle
+# FastText2ObjectStyle [📄 Project Paper](https://pdfupload.io/docs/0fd2681d)
 <table>
   <tr>
     <td align="center">
